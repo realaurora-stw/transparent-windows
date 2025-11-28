@@ -1,26 +1,17 @@
-# window_alpha_dropdown_with_cleanup.py
-# Single-file Windows tool (Python 3.8+) to set top-level window opacity via dropdown.
-# Feature: Press ` (backtick) to toggle persistent "pass-through" (click-through) mode
-# for the currently selected window. Press ` again to toggle it off.
-#
-# Behavior:
-#  - Applying opacity forces the affected window TOPMOST (best-effort).
-#  - Hold CTRL (left or right) to enable temporary click-through (passthrough) on affected windows.
-#  - Press ` to toggle persistent passthrough (per-selected-window).
-#  - If the script exits (GUI close, Ctrl+C, console close, system shutdown), it will attempt to restore
-#    all modified windows (remove layered/transparent flags and remove TOPMOST).
-#
-# Usage: Run on Windows 11/10 with Python 3.8+. Run from a console to be able to Ctrl+C.
-
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import messagebox
 import ctypes
 import ctypes.wintypes as wt
-import tkinter as tk
-from tkinter import ttk, messagebox
 import signal
 import atexit
 import sys
 import os
 from typing import Dict
+
+# -------------------------------------------------------------------------
+# BACKEND: WIN32 API & LOGIC
+# -------------------------------------------------------------------------
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -31,580 +22,394 @@ WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
 LWA_ALPHA = 0x00000002
 
-# SetWindowPos flags and HWNDs
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
-HWND_TOPMOST = ctypes.c_void_p(-1)  # (HWND)-1
-HWND_NOTOPMOST = ctypes.c_void_p(-2)  # (HWND)-2
+HWND_TOPMOST = ctypes.c_void_p(-1)
+HWND_NOTOPMOST = ctypes.c_void_p(-2)
 
-# Safe wintype fallbacks
+# Safe wintypes
 HWND = getattr(wt, "HWND", ctypes.c_void_p)
 DWORD = getattr(wt, "DWORD", ctypes.c_ulong)
-LONG = getattr(wt, "LONG", ctypes.c_long)
-UINT = getattr(wt, "UINT", ctypes.c_uint)
-LPARAM = getattr(wt, "LPARAM", ctypes.c_void_p)
 BOOL = getattr(wt, "BOOL", ctypes.c_int)
 
-# Win32 functions
-EnumWindows = user32.EnumWindows
-EnumWindowsProc = ctypes.WINFUNCTYPE(BOOL, HWND, LPARAM)
-IsWindowVisible = user32.IsWindowVisible
-GetWindowTextLength = user32.GetWindowTextLengthW
-GetWindowText = user32.GetWindowTextW
-GetClassName = user32.GetClassNameW
-GetWindowThreadProcessId = user32.GetWindowThreadProcessId
-SetWindowLongPtr = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
-GetWindowLongPtr = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
-SetLayeredWindowAttributes = user32.SetLayeredWindowAttributes
-GetAncestor = user32.GetAncestor
-SetWindowPos = user32.SetWindowPos
-GetAsyncKeyState = user32.GetAsyncKeyState
-GA_ROOT = 2
-
-# VK codes
-VK_CONTROL = 0x11
-VK_LCONTROL = 0xA2
-VK_RCONTROL = 0xA3
-VK_OEM_3 = 0xC0  # Backtick/tilde key on US keyboards; may vary on other layouts
-
-# Storage for windows we modify so we can restore later
-# hwnd (int) -> {"orig_ex": int, "alpha": int (0..255), "passthrough": bool, "is_topmost": bool, "passthrough_locked": bool}
+# State Storage
+# hwnd (int) -> {"orig_ex": int, "alpha": int, "passthrough": bool, "is_topmost": bool, "passthrough_locked": bool}
 modified_windows: Dict[int, Dict] = {}
-
-def hwnd_to_int(hwnd):
-    try:
-        return int(hwnd)
-    except Exception:
-        try:
-            return ctypes.cast(hwnd, ctypes.c_void_p).value
-        except Exception:
-            return 0
-
-def get_window_text(hwnd):
-    try:
-        length = GetWindowTextLength(hwnd)
-        if length == 0:
-            return ""
-        buff = ctypes.create_unicode_buffer(length + 1)
-        GetWindowText(hwnd, buff, length + 1)
-        return buff.value
-    except Exception:
-        return ""
-
-def get_class_name(hwnd):
-    try:
-        buff = ctypes.create_unicode_buffer(256)
-        GetClassName(hwnd, buff, 256)
-        return buff.value
-    except Exception:
-        return ""
-
-def enum_top_level_windows():
-    """Return list of tuples (hwnd_int, title, class_name) for visible top-level windows."""
-    windows = []
-
-    @EnumWindowsProc
-    def _enum_proc(hwnd, lParam):
-        try:
-            if not IsWindowVisible(hwnd):
-                return 1  # continue
-            try:
-                top = GetAncestor(hwnd, GA_ROOT)
-                if top:
-                    hwnd_use = top
-                else:
-                    hwnd_use = hwnd
-            except Exception:
-                hwnd_use = hwnd
-
-            hid = hwnd_to_int(hwnd_use)
-            if hid == 0:
-                return 1
-
-            title = get_window_text(hwnd_use).strip()
-            cls = get_class_name(hwnd_use)
-            windows.append((hid, title, cls))
-        except Exception:
-            pass
-        return 1  # continue enumeration
-
-    EnumWindows(_enum_proc, 0)
-    seen = set()
-    unique = []
-    for h, t, c in windows:
-        if h not in seen:
-            seen.add(h)
-            unique.append((h, t, c))
-    return unique
 
 def safe_GetWindowLongPtr(hwnd_int, index=GWL_EXSTYLE):
     try:
-        return GetWindowLongPtr(ctypes.c_void_p(hwnd_int), index)
-    except Exception:
-        try:
-            return GetWindowLongPtr(hwnd_int, index)
-        except Exception:
-            return 0
+        return user32.GetWindowLongW(ctypes.c_void_p(hwnd_int), index)
+    except:
+        return 0
 
 def safe_SetWindowLongPtr(hwnd_int, index, new_value):
     try:
-        return SetWindowLongPtr(ctypes.c_void_p(hwnd_int), index, new_value)
-    except Exception:
-        try:
-            return SetWindowLongPtr(hwnd_int, index, new_value)
-        except Exception:
-            return 0
+        return user32.SetWindowLongW(ctypes.c_void_p(hwnd_int), index, new_value)
+    except:
+        return 0
 
 def set_window_alpha(hwnd_int, alpha_0_100):
-    """Apply layered alpha to top-level window and make it topmost.
-    alpha_0_100 is 0..100 (0 transparent, 100 opaque)."""
-    if not hwnd_int:
-        return False
-    # store original exstyle if first time
+    if not hwnd_int: return False
+    
     if hwnd_int not in modified_windows:
-        try:
-            orig_ex = safe_GetWindowLongPtr(hwnd_int, GWL_EXSTYLE)
-        except Exception:
-            orig_ex = 0
-        modified_windows[hwnd_int] = {"orig_ex": orig_ex, "alpha": 255, "passthrough": False, "is_topmost": False, "passthrough_locked": False}
+        orig = safe_GetWindowLongPtr(hwnd_int, GWL_EXSTYLE)
+        modified_windows[hwnd_int] = {"orig_ex": orig, "alpha": 255, "passthrough": False, "is_topmost": False, "passthrough_locked": False}
 
-    # ensure layered style
     cur_ex = safe_GetWindowLongPtr(hwnd_int, GWL_EXSTYLE)
     if not (cur_ex & WS_EX_LAYERED):
-        new_ex = cur_ex | WS_EX_LAYERED
-        safe_SetWindowLongPtr(hwnd_int, GWL_EXSTYLE, new_ex)
+        safe_SetWindowLongPtr(hwnd_int, GWL_EXSTYLE, cur_ex | WS_EX_LAYERED)
 
     a_byte = int(max(0, min(100, int(alpha_0_100))) * 255 / 100)
     try:
-        res = SetLayeredWindowAttributes(ctypes.c_void_p(hwnd_int), 0, a_byte, LWA_ALPHA)
-    except Exception:
-        res = 0
+        user32.SetLayeredWindowAttributes(ctypes.c_void_p(hwnd_int), 0, a_byte, LWA_ALPHA)
+    except:
+        return False
+        
     modified_windows[hwnd_int]["alpha"] = a_byte
 
-    # Make topmost (best-effort). Mark as topmost in our storage.
+    # Force Topmost
     try:
-        SetWindowPos(ctypes.c_void_p(hwnd_int), HWND_TOPMOST,
-                     0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        user32.SetWindowPos(ctypes.c_void_p(hwnd_int), HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
         modified_windows[hwnd_int]["is_topmost"] = True
-    except Exception:
-        modified_windows[hwnd_int]["is_topmost"] = False
-
-    return bool(res)
+    except:
+        pass
+    return True
 
 def set_passthrough_for_hwnd(hwnd_int, enable=True, mark_locked=False):
-    """Temporarily add/remove WS_EX_TRANSPARENT to allow clicks through.
-       If the window wasn't tracked before, create a modified_windows entry to allow later restoration.
-       mark_locked is used when enabling 'persistent' passthrough - it sets passthrough_locked flag.
-    """
     try:
-        # ensure we have an entry
         if hwnd_int not in modified_windows:
-            try:
-                orig_ex = safe_GetWindowLongPtr(hwnd_int, GWL_EXSTYLE)
-            except Exception:
-                orig_ex = 0
-            modified_windows[hwnd_int] = {"orig_ex": orig_ex, "alpha": 255, "passthrough": False, "is_topmost": False, "passthrough_locked": False}
+            orig = safe_GetWindowLongPtr(hwnd_int, GWL_EXSTYLE)
+            modified_windows[hwnd_int] = {"orig_ex": orig, "alpha": 255, "passthrough": False, "is_topmost": False, "passthrough_locked": False}
 
         cur_ex = safe_GetWindowLongPtr(hwnd_int, GWL_EXSTYLE)
+        
         if enable:
-            if cur_ex & WS_EX_TRANSPARENT:
-                # already enabled; still mark flags
-                modified_windows[hwnd_int]["passthrough"] = True
-                if mark_locked:
-                    modified_windows[hwnd_int]["passthrough_locked"] = True
-                return True
-            new_ex = cur_ex | WS_EX_TRANSPARENT
-            safe_SetWindowLongPtr(hwnd_int, GWL_EXSTYLE, new_ex)
+            if not (cur_ex & WS_EX_TRANSPARENT):
+                safe_SetWindowLongPtr(hwnd_int, GWL_EXSTYLE, cur_ex | WS_EX_TRANSPARENT)
+            
             modified_windows[hwnd_int]["passthrough"] = True
             if mark_locked:
                 modified_windows[hwnd_int]["passthrough_locked"] = True
-            # Reapply layered alpha in case changing styles nuked it
-            info = modified_windows.get(hwnd_int)
-            if info:
-                try:
-                    SetLayeredWindowAttributes(ctypes.c_void_p(hwnd_int), 0, info.get("alpha", 255), LWA_ALPHA)
-                except Exception:
-                    pass
-            return True
         else:
-            if not (cur_ex & WS_EX_TRANSPARENT):
-                # already disabled
-                modified_windows[hwnd_int]["passthrough"] = False
-                modified_windows[hwnd_int]["passthrough_locked"] = False
-                return True
-            new_ex = cur_ex & (~WS_EX_TRANSPARENT)
-            safe_SetWindowLongPtr(hwnd_int, GWL_EXSTYLE, new_ex)
+            if cur_ex & WS_EX_TRANSPARENT:
+                safe_SetWindowLongPtr(hwnd_int, GWL_EXSTYLE, cur_ex & (~WS_EX_TRANSPARENT))
+            
             modified_windows[hwnd_int]["passthrough"] = False
             modified_windows[hwnd_int]["passthrough_locked"] = False
-            # Reapply layered alpha
-            info = modified_windows.get(hwnd_int)
-            if info:
-                try:
-                    SetLayeredWindowAttributes(ctypes.c_void_p(hwnd_int), 0, info.get("alpha", 255), LWA_ALPHA)
-                except Exception:
-                    pass
-            return True
-    except Exception:
-        return False
 
-def remove_topmost(hwnd_int):
-    try:
-        SetWindowPos(ctypes.c_void_p(hwnd_int), HWND_NOTOPMOST,
-                     0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        # Re-apply alpha just in case style change reset it
+        info = modified_windows.get(hwnd_int)
+        if info:
+             user32.SetLayeredWindowAttributes(ctypes.c_void_p(hwnd_int), 0, info.get("alpha", 255), LWA_ALPHA)
         return True
-    except Exception:
+    except:
         return False
 
 def restore_window(hwnd_int):
     if hwnd_int in modified_windows:
         info = modified_windows[hwnd_int]
         try:
-            # restore alpha to 100%
-            SetLayeredWindowAttributes(ctypes.c_void_p(hwnd_int), 0, 255, LWA_ALPHA)
-        except Exception:
-            pass
-        try:
+            user32.SetLayeredWindowAttributes(ctypes.c_void_p(hwnd_int), 0, 255, LWA_ALPHA)
             safe_SetWindowLongPtr(hwnd_int, GWL_EXSTYLE, info["orig_ex"])
-        except Exception:
-            pass
-        # remove topmost (best-effort)
-        try:
-            remove_topmost(hwnd_int)
-        except Exception:
+            user32.SetWindowPos(ctypes.c_void_p(hwnd_int), HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        except:
             pass
         del modified_windows[hwnd_int]
 
 def restore_all():
-    # Best-effort restore of everything we've changed. Safe to call many times.
     for h in list(modified_windows.keys()):
-        try:
-            restore_window(h)
-        except Exception:
-            pass
+        restore_window(h)
 
-# ---------- Cleanup / Signal handling ----------
-# atexit fallback: always try to restore
+# Cleanup Hooks
 atexit.register(restore_all)
+def signal_handler(signum, frame):
+    restore_all()
+    sys.exit(0)
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
-# Signal handler for SIGINT / SIGTERM (Ctrl+C from console)
-def _py_signal_handler(signum, frame):
-    try:
-        restore_all()
-    except Exception:
-        pass
-    # be polite: exit
-    try:
-        sys.exit(0)
-    except Exception:
-        os._exit(0)
+# -------------------------------------------------------------------------
+# UTILS
+# -------------------------------------------------------------------------
 
-# Register Python-level signals
-try:
-    signal.signal(signal.SIGINT, _py_signal_handler)
-except Exception:
-    pass
-try:
-    signal.signal(signal.SIGTERM, _py_signal_handler)
-except Exception:
-    pass
+def get_visible_windows():
+    """Returns list of (hwnd, title) excluding system garbage."""
+    EnumWindows = user32.EnumWindows
+    EnumWindowsProc = ctypes.WINFUNCTYPE(BOOL, HWND, ctypes.c_void_p)
+    IsWindowVisible = user32.IsWindowVisible
+    GetWindowTextLength = user32.GetWindowTextLengthW
+    GetWindowText = user32.GetWindowTextW
+    
+    wins = []
+    
+    @EnumWindowsProc
+    def enum_proc(hwnd, lParam):
+        if not IsWindowVisible(hwnd): return 1
+        length = GetWindowTextLength(hwnd)
+        if length > 0:
+            buff = ctypes.create_unicode_buffer(length + 1)
+            GetWindowText(hwnd, buff, length + 1)
+            title = buff.value
+            # Filter out common junk
+            if title not in ["Program Manager", "Settings", "Microsoft Text Input Application"]:
+                 wins.append((hwnd, title))
+        return 1
+        
+    EnumWindows(enum_proc, 0)
+    return sorted(wins, key=lambda x: x[1].lower())
 
-# Windows console control handler (so console close / shutdown also triggers restore)
-# Prototype: BOOL HandlerRoutine(DWORD dwCtrlType)
-try:
-    PHANDLER_ROUTINE = ctypes.WINFUNCTYPE(BOOL, DWORD)
-    def _console_handler(dwCtrlType):
-        # dwCtrlType: CTRL_C_EVENT=0, CTRL_BREAK_EVENT=1, CTRL_CLOSE_EVENT=2, CTRL_LOGOFF_EVENT=5, CTRL_SHUTDOWN_EVENT=6
-        try:
-            restore_all()
-        except Exception:
-            pass
-        # Return True to indicate we've handled it (prevents default immediate termination so we can cleanup)
-        return True
-    # Keep a reference so it won't be GC'd
-    console_handler_ref = PHANDLER_ROUTINE(_console_handler)
-    try:
-        kernel32.SetConsoleCtrlHandler(console_handler_ref, True)
-    except Exception:
-        # best-effort; not fatal if it fails
-        console_handler_ref = None
-except Exception:
-    console_handler_ref = None
+# -------------------------------------------------------------------------
+# FRONTEND: MODERN UI (CustomTkinter)
+# -------------------------------------------------------------------------
 
-# ---------- GUI ----------
-class App:
-    POLL_MS = 60  # poll interval for CTRL state & window list refresh tasks
+# Set Theme
+ctk.set_appearance_mode("Dark") 
+ctk.set_default_color_theme("blue")
 
-    def __init__(self, root):
-        self.root = root
-        root.title("Window Opacity — Dropdown selector (Topmost + CTRL passthrough + ` toggle)")
-        root.geometry("720x360")
-        root.resizable(False, False)
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
 
-        frm = ttk.Frame(root, padding=12)
-        frm.pack(fill=tk.BOTH, expand=True)
-
-        top_row = ttk.Frame(frm)
-        top_row.pack(fill=tk.X)
-
-        self.refresh_btn = ttk.Button(top_row, text="Refresh window list", command=self.refresh_windows)
-        self.refresh_btn.pack(side=tk.LEFT)
-
-        self.help_label = ttk.Label(top_row, text="Select a top-level window, control opacity. Affected windows become TOPMOST.")
-        self.help_label.pack(side=tk.LEFT, padx=(8,0))
-
-        info_row = ttk.Frame(frm)
-        info_row.pack(fill=tk.X, pady=(8,0))
-        ttk.Label(info_row, text="Hold CTRL (Left or Right) to temporarily pass mouse events through affected windows. Press ` to toggle persistent passthrough on the selected window.").pack(anchor=tk.W)
-
-        # Combobox (dropdown)
-        combo_row = ttk.Frame(frm)
-        combo_row.pack(fill=tk.X, pady=(10,0))
-        ttk.Label(combo_row, text="Open windows:").pack(anchor=tk.W)
-        self.combo_var = tk.StringVar()
-        self.combo = ttk.Combobox(combo_row, textvariable=self.combo_var, state="readonly", width=105)
-        self.combo.pack(fill=tk.X)
-        self.windows_list = []  # list of tuples (hwnd_int, title, class)
-        self.combo.bind("<<ComboboxSelected>>", self.on_select)
-
-        # Slider
-        self.alpha_var = tk.IntVar(value=100)
-        slider_row = ttk.Frame(frm)
-        slider_row.pack(fill=tk.X, pady=(12,0))
-        ttk.Label(slider_row, text="Opacity:").pack(anchor=tk.W)
-        self.alpha_scale = ttk.Scale(slider_row, from_=0, to=100, orient=tk.HORIZONTAL,
-                                     variable=self.alpha_var, command=self.on_scale)
-        self.alpha_scale.pack(fill=tk.X)
-        self.alpha_display = ttk.Label(slider_row, text="100%")
-        self.alpha_display.pack(anchor=tk.E, pady=(4,0))
-
-        # Buttons
-        btn_row = ttk.Frame(frm)
-        btn_row.pack(fill=tk.X, pady=(12,0))
-        self.apply_btn = ttk.Button(btn_row, text="Apply to Selected (Topmost)", command=self.apply_to_selected)
-        self.apply_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,6))
-        self.restore_btn = ttk.Button(btn_row, text="Restore Selected", command=self.restore_selected)
-        self.restore_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0,6))
-        self.restore_all_btn = ttk.Button(btn_row, text="Restore All", command=self.restore_all_click)
-        self.restore_all_btn.pack(side=tk.LEFT, expand=True, fill=tk.X)
-
-        exit_row = ttk.Frame(frm)
-        exit_row.pack(fill=tk.X, pady=(10,0))
-        self.exit_btn = ttk.Button(exit_row, text="Restore & Exit", command=self.exit_app)
-        self.exit_btn.pack(fill=tk.X)
-
-        # status
-        self.status = ttk.Label(frm, text="", foreground="gray")
-        self.status.pack(pady=(8,0))
-
-        # CTRL state indicator
-        ctrl_row = ttk.Frame(frm)
-        ctrl_row.pack(fill=tk.X, pady=(6,0))
-        self.ctrl_state_label = ttk.Label(ctrl_row, text="CTRL passthrough: OFF", foreground="red")
-        self.ctrl_state_label.pack(anchor=tk.W)
-
-        # Backtick (persistent passthrough) indicator
-        backtick_row = ttk.Frame(frm)
-        backtick_row.pack(fill=tk.X, pady=(4,0))
-        self.backtick_state_label = ttk.Label(backtick_row, text="` passthrough (selected): OFF", foreground="red")
-        self.backtick_state_label.pack(anchor=tk.W)
-
-        # internal ctrl/backtick held flags & prev states for edge detection
+        # Window Config
+        self.title("GhostWindow")
+        self.geometry("500x650")
+        self.resizable(False, False)
+        
+        # State
+        self.windows_map = {} # title -> hwnd
+        self.selected_hwnd = None
+        self.poll_ms = 50
         self.ctrl_held = False
-        self.backtick_prev = False  # previous polled state for backtick key
+        self.backtick_prev = False
+        self.programmatic_update = False # Prevent UI callbacks loop
 
-        # initial populate and start polling
-        self.root.after(100, self.refresh_windows)
-        self.root.after(self.POLL_MS, self._poll_inputs)
+        # --- LAYOUT ---
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1) # Content expands
 
-        # Also bind the backtick to GUI when focused (nice to have)
-        try:
-            root.bind_all('`', lambda ev: self._toggle_backtick_for_selected())
-        except Exception:
-            pass
+        # 1. Header
+        self.header_frame = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        self.header_frame.grid(row=0, column=0, sticky="ew", pady=(20, 10), padx=20)
+        
+        self.lbl_title = ctk.CTkLabel(self.header_frame, text="GhostWindow", font=("Roboto Medium", 24))
+        self.lbl_title.pack(side="left")
+        
+        self.lbl_ver = ctk.CTkLabel(self.header_frame, text="v2.0", text_color="gray", font=("Arial", 12))
+        self.lbl_ver.pack(side="left", padx=10, pady=(8,0))
+
+        # 2. Window Selection Card
+        self.card_select = ctk.CTkFrame(self)
+        self.card_select.grid(row=1, column=0, sticky="ew", padx=20, pady=10)
+        
+        ctk.CTkLabel(self.card_select, text="TARGET WINDOW", font=("Arial", 11, "bold"), text_color="#AAB0B5").pack(anchor="w", padx=15, pady=(15, 5))
+        
+        self.combo_var = ctk.StringVar(value="Select a window...")
+        self.combo = ctk.CTkComboBox(self.card_select, variable=self.combo_var, command=self.on_window_select, width=300)
+        self.combo.pack(fill="x", padx=15, pady=(0, 10))
+        
+        self.btn_refresh = ctk.CTkButton(self.card_select, text="Refresh List", command=self.refresh_windows, height=24, fg_color="transparent", border_width=1, text_color=("gray10", "#DCE4EE"))
+        self.btn_refresh.pack(anchor="e", padx=15, pady=(0, 15))
+
+        # 3. Controls Card
+        self.card_controls = ctk.CTkFrame(self)
+        self.card_controls.grid(row=2, column=0, sticky="new", padx=20, pady=10)
+        
+        # Slider Section
+        ctk.CTkLabel(self.card_controls, text="OPACITY / VISIBILITY", font=("Arial", 11, "bold"), text_color="#AAB0B5").pack(anchor="w", padx=15, pady=(15, 5))
+        
+        self.slider_val_label = ctk.CTkLabel(self.card_controls, text="100%", font=("Arial", 20, "bold"))
+        self.slider_val_label.pack(pady=(0, 5))
+        
+        self.slider = ctk.CTkSlider(self.card_controls, from_=10, to=100, number_of_steps=90, command=self.on_slider)
+        self.slider.set(100)
+        self.slider.pack(fill="x", padx=20, pady=(0, 20))
+
+        self.sep = ctk.CTkProgressBar(self.card_controls, height=2, progress_color="#404040")
+        self.sep.set(1) # full line
+        self.sep.pack(fill="x", padx=0, pady=10)
+
+        # Interaction Section
+        ctk.CTkLabel(self.card_controls, text="INTERACTION MODE", font=("Arial", 11, "bold"), text_color="#AAB0B5").pack(anchor="w", padx=15, pady=(10, 5))
+
+        # Switch: Locked Passthrough
+        self.switch_lock_var = ctk.BooleanVar(value=False)
+        self.switch_lock = ctk.CTkSwitch(self.card_controls, text="Click-Through Locked", variable=self.switch_lock_var, command=self.on_toggle_lock, font=("Arial", 13))
+        self.switch_lock.pack(anchor="w", padx=15, pady=(5, 5))
+        
+        lbl_hint_1 = ctk.CTkLabel(self.card_controls, text="Shortcut: Press ` (Backtick) to toggle", font=("Arial", 10), text_color="gray")
+        lbl_hint_1.pack(anchor="w", padx=54, pady=(0, 10))
+
+        # Indicator: Temp Passthrough
+        self.ctrl_indicator = ctk.CTkButton(self.card_controls, text="CTRL Key: Released", state="disabled", fg_color="transparent", border_width=1, border_color="#555", text_color="#888", width=200)
+        self.ctrl_indicator.pack(anchor="w", padx=15, pady=(5, 0))
+        
+        lbl_hint_2 = ctk.CTkLabel(self.card_controls, text="Hold CTRL to temporarily click through transparent windows.", font=("Arial", 10), text_color="gray", wraplength=400, justify="left")
+        lbl_hint_2.pack(anchor="w", padx=15, pady=(5, 20))
+
+        # 4. Action Buttons
+        self.btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.btn_frame.grid(row=3, column=0, sticky="ew", padx=20, pady=(10, 20))
+        
+        self.btn_restore = ctk.CTkButton(self.btn_frame, text="Restore Selected", fg_color="#C0392B", hover_color="#E74C3C", command=self.restore_current)
+        self.btn_restore.pack(side="left", expand=True, fill="x", padx=(0, 5))
+
+        self.btn_reset_all = ctk.CTkButton(self.btn_frame, text="Reset All & Exit", fg_color="#555", hover_color="#666", command=self.exit_app)
+        self.btn_reset_all.pack(side="left", expand=True, fill="x", padx=(5, 0))
+
+        # 5. Status Bar
+        self.status_bar = ctk.CTkLabel(self, text="Ready.", text_color="gray", anchor="w", font=("Arial", 10))
+        self.status_bar.grid(row=4, column=0, sticky="ew", padx=20, pady=(0, 10))
+
+        # Init Data
+        self.refresh_windows()
+        
+        # Start Poll Loop
+        self.after(self.poll_ms, self.poll_inputs)
+
+    def status(self, msg):
+        self.status_bar.configure(text=msg)
 
     def refresh_windows(self):
-        try:
-            wins = enum_top_level_windows()
-            entries = []
-            self.windows_list = []
-            for hwnd, title, cls in wins:
-                display_title = title if title else "<no title>"
-                entry = f"{hwnd} — {display_title} ({cls})"
-                entries.append(entry)
-                self.windows_list.append((hwnd, display_title, cls))
-            if not entries:
-                entries = ["<no windows found>"]
-                self.combo.config(values=entries)
-                self.combo_var.set(entries[0])
-                self.status.config(text="No top-level visible windows detected.")
-            else:
-                self.combo.config(values=entries)
-                # keep previous selection if possible
-                if not self.combo_var.get() and entries:
-                    self.combo_var.set(entries[0])
-                elif self.combo_var.get() not in entries:
-                    self.combo_var.set(entries[0])
-                self.status.config(text=f"Found {len(entries)} windows.")
-        except Exception as e:
-            self.status.config(text=f"Error enumerating windows: {e}")
-
-    def on_select(self, _ev=None):
-        sel = self.combo.current()
-        if sel < 0 or sel >= len(self.windows_list):
-            return
-        hwnd = self.windows_list[sel][0]
-        info = modified_windows.get(hwnd)
-        if info:
-            a = info.get("alpha", 255)
-            pct = int(a * 100 / 255)
-            self.alpha_var.set(pct)
-            self.alpha_display.config(text=f"{pct}%")
-            # update backtick label for this selection
-            locked = info.get("passthrough_locked", False)
-            if locked:
-                self.backtick_state_label.config(text=f"` passthrough (selected): ON (locked)", foreground="green")
-            else:
-                self.backtick_state_label.config(text=f"` passthrough (selected): OFF", foreground="red")
+        wins = get_visible_windows()
+        self.windows_map = {f"{title}": hwnd for hwnd, title in wins}
+        
+        # Create display names (Handle duplicates if necessary, simpler here)
+        display_names = list(self.windows_map.keys())
+        
+        if not display_names:
+            display_names = ["No visible windows found"]
+            self.combo.configure(state="disabled")
         else:
-            self.alpha_var.set(100)
-            self.alpha_display.config(text="100%")
-            self.backtick_state_label.config(text=f"` passthrough (selected): OFF", foreground="red")
+            self.combo.configure(state="normal")
+            
+        self.combo.configure(values=display_names)
+        
+        # Restore selection if exists
+        if self.selected_hwnd:
+            # Find title for hwnd
+            found = False
+            for title, h in self.windows_map.items():
+                if h == self.selected_hwnd:
+                    self.combo_var.set(title)
+                    found = True
+                    break
+            if not found and display_names:
+                self.combo_var.set(display_names[0])
+                self.on_window_select(display_names[0])
+        elif display_names:
+             self.combo_var.set(display_names[0])
+             self.on_window_select(display_names[0])
 
-    def on_scale(self, _ev=None):
-        val = int(self.alpha_var.get())
-        self.alpha_display.config(text=f"{val}%")
-
-    def apply_to_selected(self):
-        sel = self.combo.current()
-        if sel < 0 or sel >= len(self.windows_list):
-            messagebox.showinfo("No selection", "Please select a window from the dropdown.")
-            return
-        hwnd = self.windows_list[sel][0]
-        val = int(self.alpha_var.get())
-        ok = set_window_alpha(hwnd, val)
-        if ok:
-            self.status.config(text=f"Applied {val}% opacity to HWND {hwnd} and forced TOPMOST.")
+    def on_window_select(self, choice):
+        if choice not in self.windows_map: return
+        self.selected_hwnd = self.windows_map[choice]
+        
+        # Update UI to reflect window state if we already modified it
+        self.programmatic_update = True
+        if self.selected_hwnd in modified_windows:
+            info = modified_windows[self.selected_hwnd]
+            # Slider
+            alpha_pct = int(info["alpha"] * 100 / 255)
+            self.slider.set(alpha_pct)
+            self.slider_val_label.configure(text=f"{alpha_pct}%")
+            # Lock Switch
+            is_locked = info.get("passthrough_locked", False)
+            if is_locked:
+                self.switch_lock.select()
+            else:
+                self.switch_lock.deselect()
         else:
-            self.status.config(text=f"Attempted apply to HWND {hwnd}. Some apps ignore layered alpha.")
+            # Default state
+            self.slider.set(100)
+            self.slider_val_label.configure(text="100%")
+            self.switch_lock.deselect()
+        
+        self.programmatic_update = False
+        self.status(f"Target: {choice}")
 
-    def restore_selected(self):
-        sel = self.combo.current()
-        if sel < 0 or sel >= len(self.windows_list):
-            messagebox.showinfo("No selection", "Please select a window from the dropdown.")
+    def on_slider(self, val):
+        if not self.selected_hwnd: return
+        val = int(val)
+        self.slider_val_label.configure(text=f"{val}%")
+        
+        if set_window_alpha(self.selected_hwnd, val):
+            self.status(f"Opacity set to {val}%")
+        else:
+            self.status("Failed to set opacity (System Window?)")
+
+    def on_toggle_lock(self):
+        if self.programmatic_update: return
+        if not self.selected_hwnd: 
+            self.switch_lock.deselect()
             return
-        hwnd = self.windows_list[sel][0]
-        restore_window(hwnd)
-        self.status.config(text=f"Restored HWND {hwnd} (best-effort).")
-        # update UI labels
-        self.on_select()
+            
+        enable = self.switch_lock_var.get()
+        if enable:
+            set_passthrough_for_hwnd(self.selected_hwnd, enable=True, mark_locked=True)
+            self.status("Click-through LOCKED ON for current window.")
+        else:
+            # When unlocking, check if CTRL is held to decide if we keep it semi-active
+            should_be_active = self.ctrl_held
+            set_passthrough_for_hwnd(self.selected_hwnd, enable=should_be_active, mark_locked=False)
+            self.status("Click-through unlocked.")
 
-    def restore_all_click(self):
-        restore_all()
-        self.status.config(text="Restored all modified windows.")
-        # update UI labels
-        self.on_select()
+    def restore_current(self):
+        if self.selected_hwnd:
+            restore_window(self.selected_hwnd)
+            self.on_window_select(self.combo_var.get()) # Reset UI
+            self.status("Restored original window state.")
 
     def exit_app(self):
         restore_all()
-        # If running from console, this will allow the main thread to exit
+        self.destroy()
+        sys.exit(0)
+
+    # --- INPUT POLLING ---
+    def poll_inputs(self):
+        # 1. Check CTRL (Temporary Passthrough)
         try:
-            self.root.quit()
-        except Exception:
+            vk_ctrl = 0x11
+            # high-order bit set if down
+            ctrl_down = bool(user32.GetAsyncKeyState(vk_ctrl) & 0x8000)
+            
+            if ctrl_down != self.ctrl_held:
+                self.ctrl_held = ctrl_down
+                self.update_ctrl_ui(ctrl_down)
+                
+                # Apply temporary passthrough to all modified windows that AREN'T locked
+                for h, info in list(modified_windows.items()):
+                    if not info.get("passthrough_locked"):
+                        set_passthrough_for_hwnd(h, enable=ctrl_down)
+        except:
             pass
 
-    def _is_ctrl_held(self):
+        # 2. Check Backtick (Toggle Lock for Selection)
         try:
-            s1 = GetAsyncKeyState(VK_CONTROL) & 0x8000
-            s2 = GetAsyncKeyState(VK_LCONTROL) & 0x8000
-            s3 = GetAsyncKeyState(VK_RCONTROL) & 0x8000
-            return bool(s1 or s2 or s3)
-        except Exception:
-            return False
-
-    def _poll_inputs(self):
-        try:
-            # CTRL behavior (transient passthrough)
-            pressed = self._is_ctrl_held()
-            if pressed != self.ctrl_held:
-                # state changed -> toggle passthrough on all modified windows that are NOT locked
-                self.ctrl_held = pressed
-                if pressed:
-                    # enable passthrough on all modified windows that are not locked
-                    for hwnd, info in list(modified_windows.items()):
-                        try:
-                            if info.get("passthrough_locked"):
-                                continue
-                            set_passthrough_for_hwnd(hwnd, enable=True)
-                        except Exception:
-                            pass
-                    self.ctrl_state_label.config(text="CTRL passthrough: ON  (clicks go to windows behind)", foreground="green")
-                    self.status.config(text="CTRL held: passthrough enabled for affected windows (except locked ones).")
-                else:
-                    # disable passthrough on all modified windows that are not locked
-                    for hwnd, info in list(modified_windows.items()):
-                        try:
-                            if info.get("passthrough_locked"):
-                                continue
-                            set_passthrough_for_hwnd(hwnd, enable=False)
-                        except Exception:
-                            pass
-                    self.ctrl_state_label.config(text="CTRL passthrough: OFF", foreground="red")
-                    self.status.config(text="CTRL released: passthrough disabled for affected windows (except locked ones).")
-
-            # Backtick key edge-detection for persistent toggle (global best-effort)
-            try:
-                cur_b = bool(GetAsyncKeyState(VK_OEM_3) & 0x8000)
-            except Exception:
-                cur_b = False
-            if cur_b and not self.backtick_prev:
-                # rising edge -> toggle persistent passthrough for selected window
-                self._toggle_backtick_for_selected()
-            self.backtick_prev = cur_b
-        except Exception:
+            vk_tick = 0xC0 # ` key
+            tick_down = bool(user32.GetAsyncKeyState(vk_tick) & 0x8000)
+            
+            # Detect Rising Edge (Pressed now, wasn't before)
+            if tick_down and not self.backtick_prev:
+                if self.selected_hwnd:
+                    # Toggle the UI switch, which triggers the logic via command
+                    self.switch_lock.toggle() 
+            
+            self.backtick_prev = tick_down
+        except:
             pass
-        # continue polling
-        self.root.after(self.POLL_MS, self._poll_inputs)
 
-    def _toggle_backtick_for_selected(self):
-        """Toggle persistent passthrough (passthrough_locked) for the currently selected window."""
-        sel = self.combo.current()
-        if sel < 0 or sel >= len(self.windows_list):
-            self.status.config(text="No window selected to toggle persistent passthrough.")
-            return
-        hwnd = self.windows_list[sel][0]
-        info = modified_windows.get(hwnd)
-        if info and info.get("passthrough_locked"):
-            # currently locked -> unlock
-            # Determine desired runtime passthrough state after unlocking (based on current ctrl state)
-            desired_enable = self.ctrl_held
-            ok = set_passthrough_for_hwnd(hwnd, enable=desired_enable, mark_locked=False)
-            if ok:
-                self.status.config(text=f"Persistent passthrough: OFF for HWND {hwnd}. (Now {'ON' if desired_enable else 'OFF'} due to CTRL state).")
-                self.backtick_state_label.config(text=f"` passthrough (selected): OFF", foreground="red")
-            else:
-                self.status.config(text=f"Failed to disable persistent passthrough for HWND {hwnd}.")
+        self.after(self.poll_ms, self.poll_inputs)
+
+    def update_ctrl_ui(self, is_held):
+        if is_held:
+            self.ctrl_indicator.configure(text="CTRL Key: HELD (Passthrough Active)", fg_color="#2CC985", text_color="white", border_color="#2CC985")
         else:
-            # enable persistent passthrough
-            ok = set_passthrough_for_hwnd(hwnd, enable=True, mark_locked=True)
-            if ok:
-                self.status.config(text=f"Persistent passthrough: ON for HWND {hwnd}. (Window is click-through.)")
-                self.backtick_state_label.config(text=f"` passthrough (selected): ON (locked)", foreground="green")
-            else:
-                self.status.config(text=f"Failed to enable persistent passthrough for HWND {hwnd}.")
-
-def main():
-    root = tk.Tk()
-    style = ttk.Style(root)
-    app = App(root)
-    root.protocol("WM_DELETE_WINDOW", app.exit_app)
-    try:
-        root.mainloop()
-    finally:
-        # Ensure cleanup on mainloop exit (double-safety)
-        restore_all()
+            self.ctrl_indicator.configure(text="CTRL Key: Released", fg_color="transparent", text_color="#888", border_color="#555")
 
 if __name__ == "__main__":
-    main()
+    try:
+        app = App()
+        app.mainloop()
+    finally:
+        restore_all()
